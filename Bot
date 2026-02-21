@@ -1,0 +1,372 @@
+import os
+import requests
+import pandas as pd
+import numpy as np
+from telegram import Bot
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update
+import asyncio
+from datetime import datetime
+import ta
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(**name**)
+
+# ===== إعدادات البوت =====
+
+TELEGRAM_TOKEN = os.environ.get(“TELEGRAM_TOKEN”, “ضع_توكن_التيليغرام_هنا”)
+CHAT_ID = os.environ.get(“CHAT_ID”, “ضع_chat_id_هنا”)
+
+# قائمة العملات للتحليل
+
+COINS = [
+“BTC-USDT”, “ETH-USDT”, “BNB-USDT”, “SOL-USDT”, “XRP-USDT”,
+“ADA-USDT”, “DOGE-USDT”, “AVAX-USDT”, “LINK-USDT”, “DOT-USDT”,
+“MATIC-USDT”, “LTC-USDT”, “UNI-USDT”, “ATOM-USDT”, “FTM-USDT”,
+“NEAR-USDT”, “APT-USDT”, “ARB-USDT”, “OP-USDT”, “SUI-USDT”,
+“INJ-USDT”, “TIA-USDT”, “JTO-USDT”, “WLD-USDT”, “SEI-USDT”
+]
+
+MAX_SIGNALS_PER_DAY = 5
+signals_today = []
+last_signal_date = None
+
+def get_okx_candles(symbol, timeframe=“1H”, limit=100):
+“”“جلب بيانات الشمعات من OKX”””
+try:
+url = f”https://www.okx.com/api/v5/market/candles”
+params = {
+“instId”: symbol,
+“bar”: timeframe,
+“limit”: limit
+}
+response = requests.get(url, params=params, timeout=10)
+data = response.json()
+
+```
+    if data.get("code") != "0" or not data.get("data"):
+        return None
+    
+    candles = data["data"]
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "vol", "volCcy", "volCcyQuote", "confirm"])
+    df = df.astype({"open": float, "high": float, "low": float, "close": float, "vol": float})
+    df = df.iloc[::-1].reset_index(drop=True)
+    return df
+except Exception as e:
+    logger.error(f"خطأ في جلب بيانات {symbol}: {e}")
+    return None
+```
+
+def get_liquidity(symbol):
+“”“جلب بيانات السيولة”””
+try:
+url = f”https://www.okx.com/api/v5/market/ticker”
+params = {“instId”: symbol}
+response = requests.get(url, params=params, timeout=10)
+data = response.json()
+
+```
+    if data.get("code") != "0" or not data.get("data"):
+        return 0
+    
+    ticker = data["data"][0]
+    volume_24h = float(ticker.get("vol24h", 0))
+    return volume_24h
+except:
+    return 0
+```
+
+def analyze_coin(symbol):
+“”“تحليل عملة واحدة”””
+# جلب البيانات
+df_1h = get_okx_candles(symbol, “1H”, 100)
+df_4h = get_okx_candles(symbol, “4H”, 50)
+
+```
+if df_1h is None or len(df_1h) < 50:
+    return None
+
+close = df_1h["close"]
+high = df_1h["high"]
+low = df_1h["low"]
+volume = df_1h["vol"]
+
+# === المؤشرات ===
+# RSI
+rsi = ta.momentum.RSIIndicator(close, window=14).rsi().iloc[-1]
+
+# MACD
+macd_indicator = ta.trend.MACD(close)
+macd = macd_indicator.macd().iloc[-1]
+macd_signal = macd_indicator.macd_signal().iloc[-1]
+macd_diff = macd_indicator.macd_diff().iloc[-1]
+
+# EMA
+ema20 = ta.trend.EMAIndicator(close, window=20).ema_indicator().iloc[-1]
+ema50 = ta.trend.EMAIndicator(close, window=50).ema_indicator().iloc[-1]
+ema200 = ta.trend.EMAIndicator(close, window=200).ema_indicator() if len(close) >= 200 else None
+
+# Bollinger Bands
+bb = ta.volatility.BollingerBands(close, window=20)
+bb_upper = bb.bollinger_hband().iloc[-1]
+bb_lower = bb.bollinger_lband().iloc[-1]
+bb_middle = bb.bollinger_mavg().iloc[-1]
+
+# ATR للمخاطر
+atr = ta.volatility.AverageTrueRange(high, low, close, window=14).average_true_range().iloc[-1]
+
+# Stochastic
+stoch = ta.momentum.StochasticOscillator(high, low, close)
+stoch_k = stoch.stoch().iloc[-1]
+stoch_d = stoch.stoch_signal().iloc[-1]
+
+current_price = close.iloc[-1]
+
+# === تحديد الإشارة ===
+score = 0
+reasons = []
+
+# RSI
+if rsi < 30:
+    score += 3
+    reasons.append("RSI في منطقة ذروة البيع 📉")
+elif rsi < 45:
+    score += 1
+    reasons.append("RSI منخفض")
+elif rsi > 70:
+    score -= 3
+    reasons.append("RSI في منطقة ذروة الشراء ⚠️")
+elif rsi > 55:
+    score += 1
+
+# MACD
+if macd > macd_signal and macd_diff > 0:
+    score += 2
+    reasons.append("MACD إيجابي ✅")
+elif macd < macd_signal and macd_diff < 0:
+    score -= 2
+
+# EMA
+if current_price > ema20 > ema50:
+    score += 2
+    reasons.append("السعر فوق المتوسطات 📈")
+elif current_price < ema20 < ema50:
+    score -= 2
+
+# Bollinger Bands
+if current_price <= bb_lower * 1.02:
+    score += 2
+    reasons.append("السعر عند الحد السفلي لبولينجر 🎯")
+elif current_price >= bb_upper * 0.98:
+    score -= 1
+
+# Stochastic
+if stoch_k < 20 and stoch_d < 20:
+    score += 1
+    reasons.append("Stochastic في منطقة ذروة البيع")
+elif stoch_k > 80 and stoch_d > 80:
+    score -= 1
+
+# Volume
+avg_volume = volume.rolling(20).mean().iloc[-1]
+if volume.iloc[-1] > avg_volume * 1.5:
+    score += 1
+    reasons.append("حجم تداول مرتفع 📊")
+
+# === تحديد نوع الصفقة ===
+signal_type = None
+if score >= 4:
+    signal_type = "LONG 🟢"
+elif score <= -3:
+    signal_type = "SHORT 🔴"
+
+if not signal_type:
+    return None
+
+# === حساب مستويات الدخول والخروج ===
+atr_multiplier_tp = 2.0
+atr_multiplier_sl = 1.2
+
+if "LONG" in signal_type:
+    entry = current_price
+    tp1 = round(entry + (atr * atr_multiplier_tp * 0.6), 6)
+    tp2 = round(entry + (atr * atr_multiplier_tp * 1.2), 6)
+    tp3 = round(entry + (atr * atr_multiplier_tp * 2.0), 6)
+    sl = round(entry - (atr * atr_multiplier_sl), 6)
+    
+    risk = entry - sl
+    reward = tp2 - entry
+else:
+    entry = current_price
+    tp1 = round(entry - (atr * atr_multiplier_tp * 0.6), 6)
+    tp2 = round(entry - (atr * atr_multiplier_tp * 1.2), 6)
+    tp3 = round(entry - (atr * atr_multiplier_tp * 2.0), 6)
+    sl = round(entry + (atr * atr_multiplier_sl), 6)
+    
+    risk = sl - entry
+    reward = entry - tp2
+
+# نسبة المخاطرة للعائد
+rr_ratio = round(reward / risk, 2) if risk > 0 else 0
+
+# نسبة النجاح التقريبية
+success_rate = min(90, max(50, 50 + (score * 5)))
+
+# نوع الصفقة (سكالب أو سوينق)
+trade_type = "سكالب ⚡" if abs(score) < 6 else "سوينق 🌊"
+
+return {
+    "symbol": symbol,
+    "signal": signal_type,
+    "trade_type": trade_type,
+    "entry": entry,
+    "tp1": tp1,
+    "tp2": tp2,
+    "tp3": tp3,
+    "sl": sl,
+    "rr_ratio": rr_ratio,
+    "success_rate": success_rate,
+    "score": score,
+    "reasons": reasons,
+    "rsi": round(rsi, 1),
+    "atr": round(atr, 6)
+}
+```
+
+def format_signal(signal):
+“”“تنسيق رسالة الإشارة”””
+symbol_clean = signal[“symbol”].replace(”-USDT”, “”)
+
+```
+msg = f"""
+```
+
+🚨 **إشارة تداول جديدة** 🚨
+━━━━━━━━━━━━━━━━━━━━━
+💰 **العملة:** {symbol_clean}/USDT
+📊 **النوع:** {signal[“signal”]}
+⚡ **استراتيجية:** {signal[“trade_type”]}
+━━━━━━━━━━━━━━━━━━━━━
+💵 **سعر الدخول:** {signal[“entry”]}
+🎯 **TP1:** {signal[“tp1”]}
+🎯 **TP2:** {signal[“tp2”]}
+🎯 **TP3:** {signal[“tp3”]}
+🛑 **وقف الخسارة:** {signal[“sl”]}
+━━━━━━━━━━━━━━━━━━━━━
+📈 **نسبة المخاطرة/العائد:** 1:{signal[“rr_ratio”]}
+✅ **نسبة النجاح التقريبية:** {signal[“success_rate”]}%
+📉 **RSI:** {signal[“rsi”]}
+━━━━━━━━━━━━━━━━━━━━━
+📋 **أسباب الإشارة:**
+“””
+for reason in signal[“reasons”]:
+msg += f”• {reason}\n”
+
+```
+msg += f"""━━━━━━━━━━━━━━━━━━━━━
+```
+
+⚠️ **تحذير:** هذه الإشارات للمعلومات فقط، إدارة المخاطر مسؤوليتك
+🕐 {datetime.now().strftime(”%Y-%m-%d %H:%M”)}
+“””
+return msg
+
+async def scan_markets():
+“”“مسح السوق وإرسال الإشارات”””
+global signals_today, last_signal_date
+
+```
+today = datetime.now().date()
+if last_signal_date != today:
+    signals_today = []
+    last_signal_date = today
+
+if len(signals_today) >= MAX_SIGNALS_PER_DAY:
+    logger.info("وصلنا للحد الأقصى من الإشارات اليوم")
+    return
+
+bot = Bot(token=TELEGRAM_TOKEN)
+
+# ترتيب العملات حسب السيولة
+coins_with_liquidity = []
+for coin in COINS:
+    liq = get_liquidity(coin)
+    if liq > 0:
+        coins_with_liquidity.append((coin, liq))
+
+coins_with_liquidity.sort(key=lambda x: x[1], reverse=True)
+top_coins = [c[0] for c in coins_with_liquidity[:25]]
+
+signals_found = []
+
+for symbol in top_coins:
+    if len(signals_today) + len(signals_found) >= MAX_SIGNALS_PER_DAY:
+        break
+    
+    result = analyze_coin(symbol)
+    if result:
+        # تحقق إن ما أرسلنا هذه العملة اليوم
+        if symbol not in signals_today:
+            signals_found.append(result)
+
+# إرسال أفضل الإشارات
+signals_found.sort(key=lambda x: x["success_rate"], reverse=True)
+
+for signal in signals_found[:MAX_SIGNALS_PER_DAY - len(signals_today)]:
+    msg = format_signal(signal)
+    await bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode="Markdown")
+    signals_today.append(signal["symbol"])
+    await asyncio.sleep(2)
+
+if not signals_found:
+    logger.info("لا توجد إشارات قوية الآن")
+```
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+await update.message.reply_text(
+“🤖 مرحباً! أنا بوت التداول الخاص بك\n\n”
+“الأوامر المتاحة:\n”
+“/scan - مسح السوق الآن\n”
+“/status - حالة البوت\n”
+“/help - المساعدة”
+)
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+await update.message.reply_text(“🔍 جاري مسح السوق، انتظر…”)
+await scan_markets()
+await update.message.reply_text(“✅ انتهى المسح!”)
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+today = datetime.now().date()
+count = len(signals_today) if last_signal_date == today else 0
+await update.message.reply_text(
+f”📊 حالة البوت:\n”
+f”✅ يعمل بشكل طبيعي\n”
+f”📨 الإشارات اليوم: {count}/{MAX_SIGNALS_PER_DAY}\n”
+f”🕐 الوقت: {datetime.now().strftime(’%H:%M’)}”
+)
+
+async def scheduled_scan(context):
+“”“المسح التلقائي كل 4 ساعات”””
+await scan_markets()
+
+async def main():
+app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+```
+# أوامر البوت
+app.add_handler(CommandHandler("start", start_command))
+app.add_handler(CommandHandler("scan", scan_command))
+app.add_handler(CommandHandler("status", status_command))
+
+# جدولة المسح التلقائي كل 4 ساعات
+job_queue = app.job_queue
+job_queue.run_repeating(scheduled_scan, interval=14400, first=60)
+
+logger.info("🤖 البوت يعمل...")
+await app.run_polling()
+```
+
+if **name** == “**main**”:
+asyncio.run(main())
